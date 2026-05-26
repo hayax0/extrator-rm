@@ -6,17 +6,7 @@ import { join } from 'path'
 import os from 'os'
 
 // --- CONFIGURAÇÕES PARA A VERCEL ---
-// Define o tempo máximo de execução para 60 segundos (limite do plano Hobby)
-export const maxDuration = 60
-
-// No App Router, para aumentar o limite de upload, usamos esta config:
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: '10mb',
-    },
-  },
-}
+export const maxDuration = 300 
 // -----------------------------------
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
@@ -28,6 +18,9 @@ export async function POST(request: Request) {
   try {
     const formData = await request.formData()
     const file = formData.get('pdf') as File
+    
+    // Captura o termo do relatório vindo da tela. Fallback para 'LÍQUIDO SALARIAL' caso venha nulo.
+    const tipoRelatorio = (formData.get('tipoRelatorio') as string) || "LÍQUIDO SALARIAL"
 
     if (!file) {
       return NextResponse.json({ error: "Nenhum arquivo enviado." }, { status: 400 })
@@ -46,7 +39,7 @@ export async function POST(request: Request) {
     })
 
     let fileState = await ai.files.get({ name: uploadResult.name! })
-    let maxWait = 24
+    let maxWait = 60 
     while (fileState.state === 'PROCESSING' && maxWait > 0) {
       await delay(5000)
       fileState = await ai.files.get({ name: uploadResult.name! })
@@ -54,22 +47,36 @@ export async function POST(request: Request) {
     }
 
     if (fileState.state === 'FAILED' || maxWait === 0) {
-      throw new Error("O Google falhou ao ler a imagem ou o tempo esgotou.")
+      throw new Error("O Google falhou ao ler o arquivo ou o tempo esgotou.")
     }
 
+    // --- PROMPT ADAPTÁVEL BASEADO NO INPUT DO USUÁRIO ---
     const prompt = `
-      O arquivo anexo é uma imagem digitalizada de uma folha de pagamento.
-      Sua ÚNICA TAREFA: Extrair os números da coluna "Chapa".
+      O arquivo anexo é uma listagem contendo MÚLTIPLAS PÁGINAS de documentos de RH.
+      Atenção: Por erro de geração humana ou do sistema, este PDF pode conter páginas misturadas de relatórios antigos ou seções totalmente diferentes.
       
-      REGRAS OBRIGATÓRIAS:
-      1. Remova os zeros à esquerda (Ex: 00000110 vira 110).
-      2. Retorne TODOS os números em uma ÚNICA LINHA de texto, separados APENAS por vírgula.
-      3. É PROIBIDO usar quebras de linha (Enter).
-      4. Vá do primeiro ao último funcionário sem pular NENHUM.
+      SUA TAREFA IMPRESCINDÍVEL:
+      Analise minuciosamente o cabeçalho de CADA PÁGINA antes de extrair qualquer dado.
+      Você APENAS deve extrair os registros das páginas cujo cabeçalho indique explicitamente o título de relatório "${tipoRelatorio.toUpperCase()}".
+      Se a página pertencer a QUALQUER OUTRO relatório (como relatórios de outros meses ou outras listas de funcionários), VOCÊ DEVE IGNORAR a página inteira e não extrair absolutamente nada dela.
+      
+      Para as páginas VÁLIDAS que batem com o termo "${tipoRelatorio.toUpperCase()}", extraia a "Chapa" e o "Líquido" (valor financeiro posicionado no final de cada linha) de TODOS os funcionários.
+      
+      REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
+      1. Remova apenas os zeros à esquerda da Chapa (Ex: 00000270 vira 270. Mas atenção: chapas funcionais como 90000192 devem virar 90000192, nunca altere o prefixo 90000).
+      2. Mantenha o valor líquido idêntico ao formato original (Ex: 1.882,50 ou 4.394,40).
+      3. NÃO extraia valores acumulados de totais, resumos de páginas, CNPJs ou números soltos de rodapé.
+      4. Retorne APENAS as linhas dos funcionários filtrados no formato estrito: CHAPA;VALOR
+      
+      Exemplo de saída esperado:
+      270;1.882,50
+      90000192;640,00
+      
+      Não adicione saudações, introduções, cabeçalhos ou blocos de código markdown (como \`\`\`json ou \`\`\`csv). Apenas a listagem pura de CHAPA;VALOR do início ao fim.
     `
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-2.5-pro', 
       contents: [
         {
           role: "user",
@@ -82,19 +89,52 @@ export async function POST(request: Request) {
     })
 
     const textoBruto = response.text || ''
-    const chapasExtraidas = textoBruto
-      .split(',')
-      .map(chapa => parseInt(chapa.trim().replace(/[^0-9]/g, ''), 10))
-      .filter(chapa => !isNaN(chapa))
+    
+    const workbook = new ExcelJS.Workbook()
+    const worksheet = workbook.addWorksheet('Pagamentos')
+    worksheet.addRow(['Matrícula', 'Valor Líquido'])
 
-    if (chapasExtraidas.length === 0) {
-      throw new Error("Nenhuma matrícula foi encontrada no documento.")
+    const linhas = textoBruto.split('\n')
+    let totalProcessado = 0
+
+    linhas.forEach(linha => {
+      if (linha.includes(';')) {
+        const partes = linha.split(';')
+        if (partes.length >= 2) {
+          const chapaRaw = partes[0].trim().replace(/[^0-9]/g, '') 
+          const valorRaw = partes[1].trim()
+          
+          if (chapaRaw && valorRaw) {
+            // Garante o recebimento de matrículas estendidas sem quebras de índice
+            if (chapaRaw.length > 0 && chapaRaw.length < 10) {
+              const chapaNum = parseInt(chapaRaw, 10)
+              
+              // Sanitização completa do valor brasileiro para ponto flutuante computacional
+              const valorLimpo = valorRaw.replace(/\./g, '').replace(',', '.')
+              const valorNum = parseFloat(valorLimpo)
+
+              if (!isNaN(valorNum)) {
+                const row = worksheet.addRow([chapaNum, valorNum])
+                
+                // Grava o número como primitivo Real e define a máscara contábil nativa do Excel
+                row.getCell(2).numFmt = '#,##0.00'
+                totalProcessado++
+              }
+            }
+          }
+        }
+      }
+    })
+
+    console.log(`📊 Sucesso! Total de ${totalProcessado} linhas filtradas inseridas no Excel.`);
+
+    if (totalProcessado === 0) {
+      console.log("Conteúdo bruto recebido para análise:", textoBruto)
+      throw new Error("A IA não localizou nenhuma linha válida para o relatório solicitado.")
     }
 
-    const workbook = new ExcelJS.Workbook()
-    const worksheet = workbook.addWorksheet('Matrículas')
-    worksheet.addRow(['Matrícula'])
-    chapasExtraidas.forEach(chapa => worksheet.addRow([chapa]))
+    worksheet.getColumn(1).width = 15
+    worksheet.getColumn(2).width = 20
 
     const excelBuffer = await workbook.xlsx.writeBuffer()
 
@@ -106,7 +146,7 @@ export async function POST(request: Request) {
       status: 200,
       headers: {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="Resultado_Cheque.xlsx"`,
+        'Content-Disposition': `attachment; filename="Extração_${tipoRelatorio.replace(/\s+/g, '_')}.xlsx"`,
       },
     })
 
@@ -114,10 +154,7 @@ export async function POST(request: Request) {
     if (tempFilePath) {
       try { unlinkSync(tempFilePath) } catch (e) { }
     }
-    // Se o erro for de Payload Too Large, customizamos a mensagem
-    if (error.message.includes('413')) {
-      return NextResponse.json({ error: "O PDF é muito grande para os limites da Vercel (Max 10MB)." }, { status: 413 })
-    }
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    console.error("🚨 ERRO FATAL NA ROTA /api/extrair:", error);
+    return NextResponse.json({ error: error.message || "Erro interno no servidor." }, { status: 500 })
   }
 }

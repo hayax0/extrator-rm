@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 })
 
 export const metadata: Metadata = {
-  title: "Extrator RM Labore",
-  description: "Trasnsfome arquivos pdf em planilha excel",
+  title: "Extrator RM Labore Pro",
+  description: "Transforme arquivos PDF digitalizados em planilhas Excel inteligentes.",
 }
 
 export default function RootLayout({
@@ -24,10 +24,12 @@ export default function RootLayout({
 }>) {
   return (
     <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      lang="pt-BR"
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased dark`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col bg-zinc-950 text-zinc-50 font-sans">
+        {children}
+      </body>
     </html>
   )
 }
